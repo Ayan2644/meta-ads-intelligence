@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python scripts/data_importer.py --file \"data/imports/EPN-01---2-Campanhas-10-de-mar-de-2026-16-de-mar-de-2026.csv\" --date-label 2026-03-10 --also-process)",
+      "Bash(pip install:*)",
+      "Bash(python -m pip install -r scripts/requirements.txt)",
+      "Bash(python -c \":*)",
+      "Bash(python scripts/sheets_collector.py --date-label 2026-03-18)",
+      "Bash(python scripts/creative_ranking_march.py)"
+    ]
+  }
+}

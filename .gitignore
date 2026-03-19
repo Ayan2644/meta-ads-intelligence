@@ -1,0 +1,35 @@
+# Credentials — NEVER commit
+.env
+config/google-credentials.json
+
+# Google Sheets exports — regeneratable via sheets_collector.py
+data/sheets/
+
+# Raw API data — large, regeneratable, may contain PII
+data/raw/
+
+# Analysis artifacts
+.ai/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo

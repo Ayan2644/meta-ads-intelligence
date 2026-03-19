@@ -1,0 +1,539 @@
+workflow:
+  id: meta-ads-intelligence
+  name: Meta Ads Intelligence — Guided Analysis Pipeline
+  version: "2.0"
+  description: >-
+    Pipeline guiado de 5 etapas. Coleta dados da planilha Google Sheets + Meta API,
+    valida integridade, analisa campanhas e criativos com @analyst aplicando
+    analyst-rules.md e account-benchmarks.md, e gera relatório Markdown estruturado.
+    Elicita foco do usuário antes de cada análise.
+    Fase atual: somente leitura — sem escrita na Meta API.
+  type: sequential
+  trigger: "*workflow"
+  guided: true
+
+  metadata:
+    elicit: true
+    confirmation_required: true
+    phase: read-only
+    data_source_primary: "Google Sheets (planilha Templo do Perpétuo)"
+    data_source_secondary: "Meta Ads API (data/processed/)"
+    spreadsheet_id: "1_3pCHweiFK1aksrDA4KbUvmrJtzeEQwTqad3Cvdyd4I"
+    ticket_medio: 184.23
+    cpa_targets:
+      alvo: 92.12
+      bom: 102.35
+      limite: 122.82
+      corte: 153.53
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  #                              INPUTS
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  inputs:
+    date_label:
+      type: string
+      default: "today"
+      description: "Data de referência para coleta (YYYY-MM-DD). Default: hoje."
+
+    period:
+      type: string
+      default: "week"
+      choices: [today, yesterday, week, month, last7, last14, last30, custom]
+      description: "Período de análise. 'custom' requer since + until."
+
+    since:
+      type: string
+      required: false
+      description: "Data início customizada (YYYY-MM-DD)."
+
+    until:
+      type: string
+      required: false
+      description: "Data fim customizada (YYYY-MM-DD)."
+
+    sheets:
+      type: list
+      default: all
+      description: "Abas específicas a coletar. Default: todas."
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  #                              ELICITAÇÃO INICIAL
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  elicit_on_start:
+    enabled: true
+    message: |
+      Workflow Meta Ads Intelligence iniciado.
+
+      Qual período analisar?
+
+        [1] Semana atual (seg → hoje)       ← padrão
+        [2] Mês atual
+        [3] Últimos 7 dias
+        [4] Últimos 14 dias
+        [5] Período customizado (informar datas)
+
+      Responda com o número ou pressione Enter para o padrão [1].
+    default: "1"
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  #                              SEQUENCE
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  sequence:
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # ETAPA 1 — COLETA DE DADOS
+    # ─────────────────────────────────────────────────────────────────────────
+
+    - step: collect_data
+      phase: 1
+      phase_name: "Coleta de Dados"
+      agent: dev
+      elicit: false
+      duration_estimate: "10-20s"
+      scripts:
+        primary: "scripts/sheets_collector.py --date-label {date_label}"
+        secondary: "scripts/meta_collector.py (opcional — se dados da API forem necessários)"
+      creates:
+        - data/sheets/{date_label}_diario_mda.csv
+        - data/sheets/{date_label}_diario_lvc.csv
+        - data/sheets/{date_label}_diario_teus.csv
+        - data/sheets/{date_label}_ads_mda.csv
+        - data/sheets/{date_label}_ads_lvc.csv
+        - data/sheets/{date_label}_ads_teus.csv
+        - data/sheets/{date_label}_vendas_mda.csv
+        - data/sheets/{date_label}_vendas_lvc.csv
+        - data/sheets/{date_label}_vendas_teus.csv
+        - data/sheets/{date_label}_reembolsos.csv
+        - data/sheets/{date_label}_manifest.json
+      notes: |
+        Executar coleta da planilha Google Sheets.
+        A planilha é a FONTE DE VERDADE — gastos e vendas em tempo real da plataforma.
+
+        PASSOS:
+        1. Rodar: python scripts/sheets_collector.py --date-label {date_label}
+        2. Confirmar 12/12 abas coletadas no output
+        3. Verificar manifest criado em data/sheets/{date_label}_manifest.json
+
+        SE FALHAR (credenciais/rede):
+        - Verificar config/google-credentials.json
+        - Verificar conexão com internet
+        - Checar se planilha ainda está compartilhada com service account
+
+        OUTPUT: 12 CSVs + 1 manifest em data/sheets/
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # ETAPA 2 — VALIDAÇÃO DE DADOS
+    # ─────────────────────────────────────────────────────────────────────────
+
+    - step: validate_data
+      phase: 2
+      phase_name: "Validação de Dados"
+      agent: analyst
+      blockedBy: collect_data
+      elicit: false
+      duration_estimate: "5-10s"
+      requires:
+        - data/sheets/{date_label}_diario_mda.csv
+        - data/sheets/{date_label}_diario_lvc.csv
+        - data/sheets/{date_label}_reembolsos.csv
+      checks:
+        - "Todos os arquivos existem e não estão vazios"
+        - "Coluna DATA presente em diario_*.csv e ads_*.csv (coluna da planilha, não 'date' da Meta API)"
+        - "Período solicitado tem dados (não retorna 0 linhas para o filtro)"
+        - "Gasto total > 0 (conta ativa no período)"
+        - "Reembolsos.csv presente (mesmo que vazio é OK)"
+        - "STATUS filter disponível em vendas_*.csv (APPROVED + COMPLETE)"
+      notes: |
+        Verificar integridade antes de prosseguir com análise.
+        Usar scripts/aios_utils.py para todos os checks — parse correto garantido.
+
+        VALIDAÇÕES OBRIGATÓRIAS:
+        1. Checar existência dos 9 arquivos críticos em data/sheets/
+        2. Confirmar que diario_*.csv tem linhas no período via coluna 'Data' (DD/MM/YYYY)
+        3. Confirmar que ads_*.csv tem coluna 'DATA' (YYYY-MM-DD, da planilha) com dados
+           ATENÇÃO: ads_*.csv tem duas colunas de data: 'date' (Meta API) e 'DATA' (planilha)
+           Usar SEMPRE 'DATA' para filtrar — nunca 'date'
+        4. Confirmar que vendas_*.csv tem coluna STATUS com valores APPROVED/COMPLETE
+        5. Alertar se reembolsos estiver vazio (pode ser legítimo)
+        6. Alertar se LVC tiver gasto=0 (parou ~09/03/2026 — receita LVC ainda conta)
+
+        PARSER CORRETO (via aios_utils):
+        - diario: parse_date_diario() → DD/MM/YYYY
+        - vendas: parse_date_vendas() → 'DD/MM/YYYY - HH:MM' → tomar [:10]
+        - ads: parse_date_ads() → 'DATA' col → YYYY-MM-DD
+
+        OUTPUT:
+        - validated: true → prosseguir para Etapa 3
+        - validated: false → HALT e listar arquivos/períodos ausentes
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # ETAPA 3 — ANÁLISE DE CAMPANHAS
+    # ─────────────────────────────────────────────────────────────────────────
+
+    - step: analyze_campaigns
+      phase: 3
+      phase_name: "Análise de Campanhas"
+      agent: analyst
+      blockedBy: validate_data
+      elicit: true
+      duration_estimate: "2-5 min"
+      requires:
+        - config/analyst-rules.md          # LER SEMPRE PRIMEIRO
+        - config/account-benchmarks.md     # LER SEMPRE
+        - data/processed/campaign_performance.csv
+        - data/sheets/{date_label}_diario_mda.csv
+        - data/sheets/{date_label}_diario_lvc.csv
+        - data/sheets/{date_label}_diario_teus.csv
+
+      elicit_config:
+        message: |
+          Dados validados. Iniciando análise de campanhas.
+
+          Qual o foco desta análise?
+
+            [1] Visão geral — ROAS, CPA e P&L de todos os produtos    ← padrão
+            [2] Funil F1/F2/F3 — status de cada fase e movimentos
+            [3] Produto específico — foco em MDA, LVC ou TEUS
+            [4] Alerta de corte — apenas o que pausar agora
+            [5] Comparativo — semana atual vs anterior
+
+          Responda [1-5] ou Enter para padrão [1].
+        default: "1"
+        options:
+          "1":
+            label: "Visão geral"
+            script: "quick_status.py --period {period} --mode status"
+            includes: [consolidado, pl, por_produto, benchmarks]
+          "2":
+            label: "Funil F1/F2/F3"
+            script: "funnel_status.py --mode funil --period {period}"
+            includes: [classificacao_fase, janela_orcamento, candidatos_movimento]
+          "3":
+            label: "Produto específico"
+            followup: "Qual produto? [MDA / LVC / TEUS]"
+            script: "quick_status.py --period {period} --mode status"
+            includes: [produto_isolado, checkout, cpa_diario]
+          "4":
+            label: "Alerta de corte"
+            script: "quick_status.py --period {period} --mode alerts"
+            includes: [pausar_urgente, cpa_acima_corte, sem_venda]
+          "5":
+            label: "Comparativo semanal"
+            script: "weekly_compare.py --weeks 2"
+            includes: [delta_investimento, delta_roas, delta_vendas, delta_lucro]
+
+      analysis_rules:
+        - "SEMPRE ler analyst-rules.md antes de qualquer julgamento"
+        - "SEMPRE ler account-benchmarks.md para comparação histórica"
+        - "Classificar cada campanha por fase: F1/F2/F3/RMKT/F0"
+        - "Separar tráfego frio [F] vs quente [Q]"
+        - "Calcular CPA real usando ticket_medio=184.23"
+        - "Respeitar janela de 7 dias para orçamento"
+        - "ROAS saudável ≥ 1.33x | Alerta < 1.20x | Crítico < 1.15x"
+        - "Nunca recomendar ajuste de budget dentro da janela de 7 dias"
+
+      creates:
+        - .ai/{date_label}-campaigns.json
+
+      notes: |
+        @analyst analisa campanhas aplicando regras de analyst-rules.md.
+
+        ORDEM OBRIGATÓRIA:
+        1. Ler config/analyst-rules.md (substitui TODOS os defaults)
+        2. Ler config/account-benchmarks.md (referência histórica)
+        3. Elicitar foco [1-5] e aguardar resposta
+        4. Executar script correspondente ao foco escolhido
+        5. Calcular P&L cruzando diario_* + reembolsos
+        6. Classificar campanhas por fase e comparar CPA vs targets
+        7. Salvar artifact JSON
+
+        OUTPUT: .ai/{date_label}-campaigns.json
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # ETAPA 4 — ANÁLISE DE CRIATIVOS
+    # ─────────────────────────────────────────────────────────────────────────
+
+    - step: analyze_creatives
+      phase: 4
+      phase_name: "Análise de Criativos"
+      agent: analyst
+      blockedBy: analyze_campaigns
+      elicit: true
+      duration_estimate: "2-5 min"
+      requires:
+        - config/analyst-rules.md
+        - config/account-benchmarks.md
+        - data/processed/ad_performance.csv
+        - data/sheets/{date_label}_ads_mda.csv
+        - data/sheets/{date_label}_ads_lvc.csv
+        - data/sheets/{date_label}_ads_teus.csv
+        - data/sheets/{date_label}_vendas_mda.csv
+        - data/sheets/{date_label}_vendas_lvc.csv
+        - data/sheets/{date_label}_reembolsos.csv
+
+      elicit_config:
+        message: |
+          Análise de campanhas concluída. Passando para criativos.
+
+          Qual profundidade de análise de criativos?
+
+            [1] Ranking completo — todos os criativos por CPA/ROAS    ← padrão
+            [2] O que mover — candidatos F3, aprovados F2, cortes urgentes
+            [3] VSL A vs VSL B vs VSL C — qual roteiro está ganhando
+            [4] Reembolsos por criativo — UTM cruzado com taxa de reembolso
+            [5] Diagnóstico de checkout — por que o checkout está baixo
+
+          Responda [1-5] ou Enter para padrão [1].
+        default: "1"
+        options:
+          "1":
+            label: "Ranking completo"
+            script: "quick_status.py --period {period} --mode creatives"
+            includes: [ranking_cpa, status_alvo_bom_limite_corte, ctr, roas]
+          "2":
+            label: "O que mover"
+            script: "funnel_status.py --mode mover --period {period}"
+            includes: [promover_f3, promover_f2, pausar_urgente, monitorar]
+          "3":
+            label: "VSL comparison"
+            script: "funnel_status.py --mode vsl --period {period}"
+            includes: [vsl_a, vsl_b, vsl_c, por_produto, por_contexto]
+          "4":
+            label: "Reembolsos por criativo"
+            script: "funnel_status.py --mode reembolsos --period {period}"
+            includes: [utm_content, taxa_reembolso, por_produto, tendencia]
+          "5":
+            label: "Diagnóstico checkout"
+            includes: [ic_por_produto, checkout_rate, benchmark_checkout, hipoteses]
+
+      analysis_rules:
+        - "Cruzar UTM_CONTENT das vendas com Ad Name para atribuição real"
+        - "Calcular taxa de reembolso por criativo = reembolsos / vendas"
+        - "Frequência > 2.5x em F3 = alerta antecipado de saturação"
+        - "Frequência > 3.0x em F2 = saturação"
+        - "CTR < 0.90% = alerta de criativo fraco"
+        - "VSL C supera VSL A em remarketing (benchmark fev/26 — confirmar)"
+        - "Candidato F3: CPA ≤ R$92,12 sustentado por ≥ 2 dias"
+        - "Aprovado F2: CPA ≤ R$102,35 com ≥ 1-2 vendas"
+
+      creates:
+        - .ai/{date_label}-creatives.json
+
+      notes: |
+        @analyst analisa criativos cruzando ads_* + vendas_* + reembolsos.
+
+        ORDEM OBRIGATÓRIA:
+        1. Elicitar profundidade [1-5] e aguardar resposta
+        2. Executar script correspondente
+        3. Cruzar UTM_CONTENT com Ad Name para atribuição de vendas
+        4. Calcular taxa de reembolso por criativo (não só volume)
+        5. Identificar candidatos a promoção e criativos a pausar
+        6. Salvar artifact JSON
+
+        OUTPUT: .ai/{date_label}-creatives.json
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # ETAPA 5 — GERAÇÃO DO RELATÓRIO
+    # ─────────────────────────────────────────────────────────────────────────
+
+    - step: generate_report
+      phase: 5
+      phase_name: "Geração do Relatório"
+      agent: analyst
+      blockedBy: analyze_creatives
+      elicit: true
+      duration_estimate: "1-3 min"
+      requires:
+        - .ai/{date_label}-campaigns.json
+        - .ai/{date_label}-creatives.json
+
+      elicit_config:
+        message: |
+          Análises concluídas. Gerando relatório.
+
+          Qual formato do relatório?
+
+            [1] Completo — executivo + campanhas + criativos + P&L + checklist   ← padrão
+            [2] Executivo — só resumo e ações prioritárias (1 página)
+            [3] Operacional — foco no funil e movimentações (sem P&L detalhado)
+
+          Responda [1-3] ou Enter para padrão [1].
+        default: "1"
+
+      report_structure:
+        obrigatorio:
+          - "Resumo executivo (investimento, vendas, ROAS, lucro líquido, vs benchmark)"
+          - "Tabela por produto (gasto, CPA, ROAS, checkout, status)"
+          - "P&L com reembolsos discriminados"
+          - "Análise comparativa semana a semana"
+          - "Tabela de campanhas por fase (F1/F2/F3/RMKT)"
+          - "Ranking de criativos com recomendação"
+          - "VSL A vs VSL B vs VSL C"
+          - "Movimentações recomendadas por prioridade (1=urgente)"
+          - "Checklist da semana (o que fazer segunda/quarta/sexta)"
+          - "Alertas críticos destacados no topo"
+        post_check:
+          - "Nenhum placeholder vazio"
+          - "Recomendações ordenadas por prioridade"
+          - "Seção rules_applied presente"
+          - "Todos os CPAs calculados com ticket_medio=184.23"
+          - "Nenhum número inventado — tudo referenciado nos dados"
+
+      creates:
+        - docs/reports/{date_label}-report.md
+
+      notes: |
+        @analyst gera relatório Markdown a partir dos artifacts JSON.
+
+        PASSOS:
+        1. Elicitar formato [1-3] e aguardar resposta
+        2. Ler .ai/{date_label}-campaigns.json
+        3. Ler .ai/{date_label}-creatives.json
+        4. Montar relatório na estrutura obrigatória
+        5. POST-CHECK: verificar todos os itens da lista acima
+        6. Salvar docs/reports/{date_label}-report.md
+        7. Informar ao usuário o caminho do arquivo gerado
+
+        OUTPUT: docs/reports/{date_label}-report.md
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # PIPELINE COMPLETO
+    # ─────────────────────────────────────────────────────────────────────────
+
+    - meta: end
+      action: pipeline_complete
+      notes: |
+        PIPELINE COMPLETO — Meta Ads Intelligence v2.0
+
+        Artefatos gerados:
+        data/sheets/
+          {date_label}_diario_mda.csv        [Etapa 1]
+          {date_label}_diario_lvc.csv        [Etapa 1]
+          {date_label}_diario_teus.csv       [Etapa 1]
+          {date_label}_ads_mda.csv           [Etapa 1]
+          ... (12 arquivos total)
+
+        .ai/
+          {date_label}-campaigns.json        [Etapa 3]
+          {date_label}-creatives.json        [Etapa 4]
+
+        docs/reports/
+          {date_label}-report.md             [Etapa 5] <- principal
+
+        PROXIMOS PASSOS:
+        1. Revisar docs/reports/{date_label}-report.md
+        2. Executar movimentações aprovadas manualmente na plataforma Meta
+        3. Atualizar config/account-benchmarks.md se fechou semana/mês
+
+        LEMBRETE: Sistema READ-ONLY.
+        Todas as recomendações requerem execução manual pelo usuário.
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  #                         SCRIPTS DISPONÍVEIS
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  scripts:
+    collect:
+      sheets:   "python scripts/sheets_collector.py --date-label {date}"
+      meta_api: "python scripts/meta_collector.py --date-range {range}"
+      process:  "python scripts/data_processor.py --date {date}"
+      daily:    "python scripts/daily_collect.py"
+
+    analysis:
+      status:    "python scripts/quick_status.py --period {period} --mode status"
+      pl:        "python scripts/quick_status.py --period {period} --mode pl"
+      alerts:    "python scripts/quick_status.py --period {period} --mode alerts"
+      creatives: "python scripts/quick_status.py --period {period} --mode creatives"
+      funil:     "python scripts/funnel_status.py --mode funil --period {period}"
+      mover:     "python scripts/funnel_status.py --mode mover --period {period}"
+      vsl:       "python scripts/funnel_status.py --mode vsl --period {period}"
+      reembolsos:"python scripts/funnel_status.py --mode reembolsos --period {period}"
+      checklist: "python scripts/funnel_status.py --mode checklist"
+      comparar:  "python scripts/weekly_compare.py --month {YYYY-MM}"
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  #                         FLUXO
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  flow_diagram: |
+    *workflow
+        |
+        v
+    [ELICIT] Qual período?
+        |
+        v
+    ETAPA 1 — Coleta (sheets_collector.py)
+        |
+        v
+    ETAPA 2 — Validação (9 arquivos, período com dados)
+        |
+        v
+    [ELICIT] Foco da análise de campanhas? [1-5]
+        |
+        v
+    ETAPA 3 — Análise de Campanhas (@analyst + analyst-rules.md)
+        |
+        v
+    [ELICIT] Profundidade de criativos? [1-5]
+        |
+        v
+    ETAPA 4 — Análise de Criativos (@analyst + UTM cruzado)
+        |
+        v
+    [ELICIT] Formato do relatório? [1-3]
+        |
+        v
+    ETAPA 5 — Relatório Markdown
+        |
+        v
+    docs/reports/{date}-report.md
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  #                         REFERÊNCIA RÁPIDA
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  quick_reference:
+    etapa_1:
+      name: "Coleta de Dados"
+      agent: "@dev"
+      fonte: "Google Sheets (planilha Templo do Perpétuo)"
+      script: "sheets_collector.py"
+      duration: "10-20s"
+
+    etapa_2:
+      name: "Validação"
+      agent: "@analyst"
+      checks: "9 arquivos, período com dados, gasto > 0"
+      duration: "5-10s"
+
+    etapa_3:
+      name: "Análise de Campanhas"
+      agent: "@analyst"
+      reads: ["diario_*.csv", "campaign_performance.csv", "analyst-rules.md", "account-benchmarks.md"]
+      elicit: true
+      output: ".ai/{date}-campaigns.json"
+      duration: "2-5 min"
+
+    etapa_4:
+      name: "Análise de Criativos"
+      agent: "@analyst"
+      reads: ["ads_*.csv", "vendas_*.csv", "reembolsos.csv", "ad_performance.csv"]
+      elicit: true
+      output: ".ai/{date}-creatives.json"
+      duration: "2-5 min"
+
+    etapa_5:
+      name: "Relatório"
+      agent: "@analyst"
+      reads: [".ai/{date}-campaigns.json", ".ai/{date}-creatives.json"]
+      elicit: true
+      output: "docs/reports/{date}-report.md"
+      duration: "1-3 min"
+
+  time_estimate:
+    minimum: "5 min"
+    typical: "10-15 min"
+    with_deep_creative_analysis: "20-25 min"
